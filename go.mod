@@ -1,4 +1,4 @@
-module kafka-parallel-consumer-go
+module github.com/your-username/kafka-parallel-consumer-go
 
 go 1.23.10
 

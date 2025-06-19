@@ -6,10 +6,10 @@ import (
 	"log"
 	"os"
 	"os/signal"
-	"parallel-consumer/consumer"
 	"syscall"
 
 	"github.com/twmb/franz-go/pkg/kgo"
+	consumer "github.com/your-username/kafka-parallel-consumer-go"
 )
 
 const BATCH_SIZE = 5
