@@ -1,4 +1,4 @@
-module parallel-consumer
+module kafka-parallel-consumer-go
 
 go 1.23.10
 
