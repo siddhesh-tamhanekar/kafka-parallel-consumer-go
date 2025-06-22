@@ -7,7 +7,7 @@ This document demonstrates the test setup and visual dashboard of the **Parallel
 
 ## 🖥️ Live Dashboard Screenshot
 
-![Kafka Consumer Dashboard](./demo/viewer_screenshot.png)
+![Kafka Consumer Dashboard](./viewer_screenshot.png)
 
 > ⚠️ The dashboard is for **demo and visualization purposes only**. It is not required for production use. Its goal is to help visualize parallel processing, message commit status, and rebalance behavior.
 

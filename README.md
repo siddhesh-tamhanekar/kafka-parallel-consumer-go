@@ -56,7 +56,7 @@ A custom Kafka consumer with built-in concurrency support, implemented in Go. Th
 
 ## 📁 Usage Reference
 
-To understand how to run and test the consumer, refer to the `demo/` folder and the [DEMO.md](.demo/DEMO.md) guide, which describes the test setup in detail.
+To understand how to run and test the consumer, refer to the `demo/` folder and the [DEMO.md](./demo/DEMO.md) guide, which describes the test setup in detail.
 
 ---
 
