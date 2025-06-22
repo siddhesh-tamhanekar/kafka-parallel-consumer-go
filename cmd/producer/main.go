@@ -17,8 +17,8 @@ import (
 
 func main() {
 	var interval, messageCount int
-	flag.IntVar(&interval, "interval", 1000, "interval between two messages")
-	flag.IntVar(&messageCount, "count", 10, "no of messages needs to be produced")
+	flag.IntVar(&interval, "i", 1000, "interval between two messages in milliseconds")
+	flag.IntVar(&messageCount, "c", 10, "no of messages needs to be produced")
 	flag.Parse()
 	fmt.Println("starting main....")
 	ctx, cancel := context.WithCancel(context.Background())
@@ -57,6 +57,7 @@ func main() {
 			v, _ := json.Marshal(payload)
 			fmt.Println(t, payload)
 			r := kgo.Record{
+				Key:   []byte(fmt.Sprintf("key#%d", v)),
 				Topic: t,
 				Value: v,
 			}
