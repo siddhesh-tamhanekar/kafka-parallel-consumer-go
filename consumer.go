@@ -18,34 +18,40 @@ import (
 )
 
 type Consumer struct {
-	Key            string
-	BatchSize      int
-	client         Adapter
-	circularBuffer buffer
-	ch             chan struct{}
-	wg             sync.WaitGroup
-	topics         map[string][]HandleFunc
-	cpuTime        float64
-	StatListener   func(msg *StatMessage)
-	pausePoll      atomic.Bool
-	closed         bool
+	Key             string
+	BatchSize       int
+	client          Adapter
+	consumerSlot    chan struct{}
+	wg              sync.WaitGroup
+	topics          map[string][]HandleFunc
+	cpuTime         float64
+	StatListener    func(msg *StatMessage)
+	pausePoll       atomic.Bool
+	closed          bool
+	circularBuffers map[string]*buffer
 }
 type HandleFunc func(c context.Context, body []byte, headers map[string]string) error
 
 func NewConsumer(client Adapter, batchSize int, concurrency int) *Consumer {
 	c := &Consumer{
-		Key:            strconv.FormatUint(rand.Uint64(), 36),
-		BatchSize:      batchSize,
-		client:         client,
-		circularBuffer: buffer{works: make([]*work, concurrency*2), capacity: concurrency * 2},
-		ch:             make(chan struct{}, concurrency),
-		wg:             sync.WaitGroup{},
-		topics:         map[string][]HandleFunc{},
-		cpuTime:        getCPUTimeSec(),
+		Key:             strconv.FormatUint(rand.Uint64(), 36),
+		BatchSize:       batchSize,
+		client:          client,
+		consumerSlot:    make(chan struct{}, concurrency),
+		wg:              sync.WaitGroup{},
+		topics:          map[string][]HandleFunc{},
+		cpuTime:         getCPUTimeSec(),
+		circularBuffers: make(map[string]*buffer, 10),
 	}
-	c.circularBuffer.client = c.client
 	return c
 
+}
+func (c *Consumer) AddWork(w *work) bool {
+	key := fmt.Sprintf("%s|%d", w.r.Topic, w.r.Partition)
+	if _, ok := c.circularBuffers[key]; !ok {
+		c.circularBuffers[key] = &buffer{works: make([]*work, len(c.consumerSlot)), capacity: len(c.consumerSlot)}
+	}
+	return c.circularBuffers[key].Add(w)
 }
 
 // register listener and it gets invoked once message recived in topic
@@ -59,13 +65,13 @@ func (c *Consumer) Listen(topic string, fn HandleFunc) {
 
 func (c *Consumer) Run(ctx context.Context) {
 	defer c.shutdown()
-	go c.commit(ctx)
+	go c.periodicCommit(ctx)
 
 	for {
 
-		if c.circularBuffer.FreeSpace() < c.BatchSize {
-			c.SendStat("waiting for commits", "buffer_full")
-			fmt.Println("Waiting: not enough buffer space for batch")
+		if cap(c.consumerSlot)-len(c.consumerSlot) < c.BatchSize {
+			c.SendStat("waiting for commits", "max_concurrent_jobs")
+			fmt.Println("Waiting: max concurrancy is hit")
 			time.Sleep(time.Millisecond * 100)
 			continue
 		}
@@ -88,7 +94,6 @@ func (c *Consumer) Run(ctx context.Context) {
 			time.Sleep(time.Second)
 			continue
 		}
-		workid := 0
 		for _, r := range records {
 			if _, exists := c.topics[r.Topic]; !exists {
 				// log if needed
@@ -97,23 +102,29 @@ func (c *Consumer) Run(ctx context.Context) {
 			select {
 			case <-ctx.Done():
 				return
-			case c.ch <- struct{}{}:
+			case c.consumerSlot <- struct{}{}:
 			}
-			c.SendStat("waiting for commits", "processing")
+			c.SendStat("started consuming", "processing")
 
 			v := r.Value
 			r.Value = nil
 			w := &work{r, 0}
-			c.circularBuffer.Add(w)
+
+			for !c.AddWork(w) {
+				c.SendStat("add failed", "partition_buffer_full")
+				fmt.Println("Partition buffer full — AddWork returned false")
+				time.Sleep(time.Millisecond * 100)
+				continue
+			}
 			c.wg.Add(1)
-			go func(w *work, rec []byte, workid int) {
+			go func(w *work, rec []byte, r *kgo.Record) {
 				defer func() {
 					if r := recover(); r != nil {
 						log.Printf("panic during business logic: %v", r)
 					}
 					c.wg.Done()
 					atomic.StoreUint32(&w.done, 1)
-					<-c.ch
+					<-c.consumerSlot
 				}()
 
 				for _, handler := range c.topics[r.Topic] {
@@ -124,11 +135,29 @@ func (c *Consumer) Run(ctx context.Context) {
 					}
 					handler(localCtx, v, headers)
 				}
-			}(w, v, workid)
-			workid++
+			}(w, v, r)
+
 		}
 
 	}
+}
+
+func (c *Consumer) commit(ctx context.Context, reason string) (int, int) {
+	var tc, tu int
+	for _, b := range c.circularBuffers {
+		c, u := b.Commit(ctx, c.client, reason)
+		tc += c
+		tu += u
+	}
+	return tc, tu
+}
+
+func (c *Consumer) totalBufferSize() int {
+	var size int
+	for _, b := range c.circularBuffers {
+		size += b.size
+	}
+	return size
 }
 
 func (c *Consumer) shutdown() {
@@ -140,7 +169,7 @@ func (c *Consumer) shutdown() {
 
 	finalCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	c.circularBuffer.Commit(finalCtx, "shutdown")
+	c.commit(finalCtx, "shutdown")
 	c.closed = true
 	c.SendStat("shudown completed", "closed")
 	fmt.Println("shutdown completed")
@@ -152,20 +181,22 @@ type work struct {
 	done uint32
 }
 type StatMessage struct {
-	Message     string  `json:"message"`
-	Event       string  `json:"event"`           // Always "stat"
-	Key         string  `json:"key"`             // Unique consumer key
-	Status      string  `json:"status"`          // "processing", "busy", etc.
-	ActiveJobs  int     `json:"active_jobs"`     // Number of jobs in-progress
-	MemoryMB    float64 `json:"memory_mb"`       // Consumer memory usage
-	CPUPercent  float64 `json:"cpu_percent"`     // Consumer CPU usage
-	Concurrency int     `json:"max_concurrency"` // Total concurrency limit
-	Head        int
-	Tail        int
-	Buffer      []*int `json:"buffer"`
-	PollSize    int    `json:"poll_size"`
+	Message     string                     `json:"message"`
+	Event       string                     `json:"event"`           // Always "stat"
+	Key         string                     `json:"key"`             // Unique consumer key
+	Status      string                     `json:"status"`          // "processing", "busy", etc.
+	ActiveJobs  int                        `json:"active_jobs"`     // Number of jobs in-progress
+	MemoryMB    float64                    `json:"memory_mb"`       // Consumer memory usage
+	CPUPercent  float64                    `json:"cpu_percent"`     // Consumer CPU usage
+	Concurrency int                        `json:"max_concurrency"` // Total concurrency limit
+	Buffers     map[string]*BufferSnapshot `json:"buffer"`
+	PollSize    int                        `json:"poll_size"`
 }
-
+type BufferSnapshot struct {
+	Buffer []*int `json:"buffer"`
+	Head   int
+	Tail   int
+}
 type buffer struct {
 	mu       sync.Mutex
 	works    []*work
@@ -173,7 +204,6 @@ type buffer struct {
 	tail     int
 	size     int
 	capacity int
-	client   Adapter
 }
 
 func (b *buffer) FreeSpace() int {
@@ -181,14 +211,17 @@ func (b *buffer) FreeSpace() int {
 	defer b.mu.Unlock()
 	return b.capacity - b.size
 }
-func (b *buffer) Add(w *work) {
+func (b *buffer) Add(w *work) bool {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	if b.size >= b.capacity {
+		return false // no space left
+	}
 	b.works[b.tail] = w
 
 	b.tail = (b.tail + 1) % b.capacity
 	b.size++
-
+	return true
 }
 func (b *buffer) Snapshot() []*int {
 	b.mu.Lock()
@@ -208,7 +241,7 @@ func (b *buffer) Snapshot() []*int {
 	return snapshot
 }
 
-func (b *buffer) Commit(ctx context.Context, reason string) (int, int) {
+func (b *buffer) Commit(ctx context.Context, client Adapter, reason string) (int, int) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	var committed []*kgo.Record
@@ -228,7 +261,7 @@ func (b *buffer) Commit(ctx context.Context, reason string) (int, int) {
 		size--
 	}
 	if len(committed) > 0 {
-		err := b.client.Commit(ctx, committed)
+		err := client.Commit(ctx, committed)
 		fmt.Printf("%s committed %d out of %d records at %s and error is %v\n", reason, len(committed), b.size, time.Now(), err)
 		if err == nil {
 			oldHead := b.head
@@ -245,7 +278,7 @@ func (b *buffer) Commit(ctx context.Context, reason string) (int, int) {
 	return 0, b.size
 }
 
-func (c *Consumer) commit(ctx context.Context) {
+func (c *Consumer) periodicCommit(ctx context.Context) {
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
 	for {
@@ -253,7 +286,7 @@ func (c *Consumer) commit(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			commited, uncommited := c.circularBuffer.Commit(ctx, "periodic")
+			commited, uncommited := c.commit(ctx, "periodic")
 			if commited != 0 || uncommited != 0 {
 
 				c.SendStat(fmt.Sprintf("commit done %d|%d", commited, uncommited), "")
@@ -268,17 +301,23 @@ func (c *Consumer) SendStat(msg, status string) {
 	if c.StatListener == nil {
 		return
 	}
+	bs := make(map[string]*BufferSnapshot, len(c.circularBuffers))
+	for k, b := range c.circularBuffers {
+		bs[k] = &BufferSnapshot{
+			Head:   b.head,
+			Tail:   b.tail,
+			Buffer: b.Snapshot(),
+		}
+	}
 	s := &StatMessage{
 		Message:     msg,
 		Key:         c.Key,
 		Event:       "stat",
 		Status:      status,
-		ActiveJobs:  len(c.ch),
-		Concurrency: cap(c.ch),
+		ActiveJobs:  len(c.consumerSlot),
+		Concurrency: cap(c.consumerSlot),
 		PollSize:    c.BatchSize,
-		Head:        c.circularBuffer.head,
-		Tail:        c.circularBuffer.tail,
-		Buffer:      c.circularBuffer.Snapshot(),
+		Buffers:     bs,
 		MemoryMB:    getMemoryMB(),
 		CPUPercent:  measureCPUPercent(c.cpuTime),
 	}
@@ -315,7 +354,7 @@ func (c *Consumer) ForceCommit(ctx context.Context, reason string) {
 	if c.closed {
 		return
 	}
-	if c.circularBuffer.size <= 0 && len(c.ch) == 0 {
+	if c.totalBufferSize() == 0 && len(c.consumerSlot) == 0 {
 		return
 	}
 	msg := reason + ": initiate force commit"
@@ -324,12 +363,12 @@ func (c *Consumer) ForceCommit(ctx context.Context, reason string) {
 	// pause poll so current message can be commited
 	c.pausePoll.Store(true)
 	// commmit already completed work on safe side.
-	c.circularBuffer.Commit(ctx, reason)
+	c.commit(ctx, reason)
 
 	// wait for pending work to complete.
 	c.wg.Wait()
 	// final commit
-	c.circularBuffer.Commit(ctx, reason+":finailization")
+	c.commit(ctx, reason+":finailization")
 	c.pausePoll.Store(false)
 	msg = reason + ": force commit done"
 	fmt.Println("===> " + msg + " <===")
