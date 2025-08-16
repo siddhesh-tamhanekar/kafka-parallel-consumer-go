@@ -49,7 +49,7 @@ func NewConsumer(client Adapter, batchSize int, concurrency int) *Consumer {
 func (c *Consumer) AddWork(w *work) bool {
 	key := fmt.Sprintf("%s|%d", w.r.Topic, w.r.Partition)
 	if _, ok := c.circularBuffers[key]; !ok {
-		c.circularBuffers[key] = &buffer{works: make([]*work, len(c.consumerSlot)), capacity: len(c.consumerSlot)}
+		c.circularBuffers[key] = &buffer{works: make([]*work, cap(c.consumerSlot)), capacity: cap(c.consumerSlot)}
 	}
 	return c.circularBuffers[key].Add(w)
 }

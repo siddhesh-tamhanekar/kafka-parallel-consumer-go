@@ -15,7 +15,7 @@ var (
 )
 
 func main() {
-	http.Handle("/", http.FileServer(http.Dir("cmd/viewer/static")))
+	http.Handle("/", http.FileServer(http.Dir("demo/viewer/static")))
 	http.HandleFunc("/sse", serveSSE)
 	http.HandleFunc("/broadcast", broadCast)
 
